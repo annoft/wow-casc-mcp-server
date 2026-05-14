@@ -19,11 +19,24 @@ npm install
 
 ### Community Listfile
 
-`casc_find` needs a community listfile to resolve human-readable file names. Without it, files return as numeric FileDataIds.
+`casc_find` needs a community listfile to resolve human-readable file names.
+Without it, files return as numeric FileDataIds (e.g., `12345` instead of `Interface/FrameXML/UIParent.lua`).
 
-1. Download the latest community listfile (e.g., from [wow.tools](https://wow.tools/files/#listfile) or [WowDev.wiki](https://wowdev.wiki/))
-2. Save as `community-listfile.csv` in this directory
+**Source**: [wowdev/wow-listfile](https://github.com/wowdev/wow-listfile/releases) — the canonical community listfile, also used by [wow.tools.local](https://github.com/Marlamin/wow.tools.local).
+
+**Format**: CSV with `FileDataID;filename` lines:
+```
+1;interface/cinematics/logo_800.avi
+53183;sound/music/citymusic/darnassus/darnassus intro.mp3
+```
+
+**Setup**:
+1. Download `community-listfile.csv` from the [latest release](https://github.com/wowdev/wow-listfile/releases)
+2. Save to this directory
 3. Pass `listfilePath` parameter to `casc_find`
+
+**Updates**: New WoW patches add/rename files. Re-download periodically to keep lookups current.
+The listfile release is updated by the community as new files are identified.
 
 ### MCP Config
 
