@@ -5,6 +5,10 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 const casclib = require('@jamiephan/casclib');
 const { randomUUID } = require('crypto');
+const { join } = require('path');
+const { createWriteStream } = require('fs');
+const { pipeline } = require('stream/promises');
+const { stat } = require('fs/promises');
 
 const { Storage, CascStorageInfoClass } = casclib;
 
@@ -13,9 +17,18 @@ const HANDLE_TTL_MS = 10 * 60 * 1000; // 10 minutes auto-cleanup
 const READ_TIMEOUT_MS = 30_000;       // 30s per file read
 const MAX_TEXT_BYTES  = 100 * 1024;   // 100KB text truncation threshold
 const MAX_BIN_BYTES   = 500 * 1024;   // 500KB binary truncation threshold
+const LISTFILE_URL    = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
+const LISTFILE_CACHE  = join(__dirname, 'community-listfile.csv');
+const LISTFILE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 1 day
 
 // Map<handleId, { storage, timer }>
 const handles = new Map();
+
+// Listfile auto-download state: lazy-init, cached across calls
+let _listfile_path = null;
+let _listfile_ready = false;   // true once first _ensure_listfile has run
+let _listfile_error = null;
+let _listfile_downloading = null; // Promise | null — dedupe concurrent requests
 
 // --- Helpers ---
 
@@ -48,10 +61,78 @@ function _limit_response(buf, isText) {
   return { truncated: true, fullSize: buf.length, returned: limit };
 }
 
+// Listfile auto-download (lazy, cached). Follows wow.tools.local pattern:
+// download latest community-listfile.csv from wowdev/wow-listfile releases.
+// Re-download if local copy is older than LISTFILE_MAX_AGE_MS.
+async function _ensure_listfile() {
+  if (_listfile_ready) return; // already resolved (success or fail)
+
+  // Deduplicate concurrent calls
+  if (_listfile_downloading) {
+    try { await _listfile_downloading; } catch (_) {}
+    return;
+  }
+
+  _listfile_downloading = (async () => {
+    try {
+      // Check local cache
+      let stale = true;
+      try {
+        const s = await stat(LISTFILE_CACHE);
+        stale = (Date.now() - s.mtimeMs) > LISTFILE_MAX_AGE_MS;
+      } catch (_) { /* not found */ }
+
+      if (!stale) {
+        _listfile_path = LISTFILE_CACHE;
+        return;
+      }
+
+      // Download from GitHub releases
+      const res = await _with_timeout(fetch(LISTFILE_URL, {
+        redirect: 'follow',
+        headers: { 'User-Agent': 'wow-casc-mcp/1.2.0' }
+      }), READ_TIMEOUT_MS);
+
+      if (!res.ok) {
+        // If stale cache exists, keep using it
+        if (_listfile_path) { return; }
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      await pipeline(
+        res.body,
+        createWriteStream(LISTFILE_CACHE)
+      );
+
+      _listfile_path = LISTFILE_CACHE;
+    } catch (e) {
+      _listfile_error = e.message;
+      // If stale cache exists, keep using it
+      if (_listfile_path) { return; }
+      // Otherwise, listfile unavailable
+    }
+  })();
+
+  try { await _listfile_downloading; } catch (_) {}
+  _listfile_ready = true;
+}
+
+function _listfile_status() {
+  if (_listfile_path) {
+    const fresh = `cached at ${_listfile_path}`;
+    return { source: 'auto-downloaded', path: _listfile_path, status: 'available', note: fresh };
+  }
+  if (_listfile_error) {
+    return { source: 'auto-download', status: 'unavailable', error: _listfile_error,
+             hint: 'Download failed. Provide listfilePath manually or check network.' };
+  }
+  return { source: 'auto-download', status: 'unknown', hint: 'Listfile not yet resolved.' };
+}
+
 // --- Server ---
 
 const server = new Server(
-  { name: 'wow-casc', version: '1.1.0' },
+  { name: 'wow-casc', version: '1.2.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -62,6 +143,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         'Open WoW CASC storage. Returns handleId for subsequent calls. ' +
         'storagePath = WoW Data directory, e.g. "D:\\Program Files\\World of Warcraft\\_retail_\\Data". ' +
+        'Community listfile auto-downloaded on first casc_find (no manual setup needed). ' +
         'Call casc_close when done, or handle auto-expires after 10 minutes.',
       inputSchema: {
         type: 'object',
@@ -84,9 +166,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'casc_find',
       description:
-        'Find files by wildcard mask. Without listfilePath, WoW files return as numeric FileDataIds. ' +
-        'With listfilePath (community-listfile.csv), returns human-readable names. ' +
-        'Returns files array + pagination metadata (returned, has_more, total_count_hint).',
+        'Find files by wildcard mask. Community listfile is auto-downloaded by default ' +
+        '(from wowdev/wow-listfile) — no listfilePath needed. Override with listfilePath for custom listfile. ' +
+        'Without any listfile, files return as numeric FileDataIds. ' +
+        'Returns files array + pagination metadata (returned, has_more, total_count).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -176,6 +259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           codeName: product.codeName,
           buildNumber: product.buildNumber,
           ttlMinutes: 10,
+          listfile: 'auto-downloaded from wowdev/wow-listfile on first casc_find',
           hint: 'Use this handleId with casc_find and casc_read. Call casc_close when done, or handle auto-expires.'
         }) }]
       };
@@ -189,10 +273,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
       _register_ttl(args.handleId);
       const storage = entry.storage;
+
+      // Resolve listfile: user-provided > auto-downloaded > none
+      let listfilePath = args.listfilePath || '';
+      let listfileMeta;
+      if (args.listfilePath) {
+        listfileMeta = { source: 'user-provided', path: args.listfilePath };
+      } else {
+        await _ensure_listfile();
+        listfileMeta = _listfile_status();
+        if (_listfile_path) {
+          listfilePath = _listfile_path;
+        }
+      }
+
       const max = Math.min(args.maxResults || 200, 1000);
       const results = [];
       let totalCount = 0;
-      let entry_iter = storage.findFirstFile(args.mask, args.listfilePath || '');
+      let entry_iter = storage.findFirstFile(args.mask, listfilePath);
       while (entry_iter) {
         totalCount++;
         if (results.length < max) {
@@ -212,6 +310,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           returned: results.length,
           total_count: totalCount,
           has_more: hasMore,
+          listfile: listfileMeta,
           ...(hasMore && {
             hint: `${totalCount - max} more files match. Narrow your mask or increase maxResults (max 1000).`
           }),

@@ -19,24 +19,23 @@ npm install
 
 ### Community Listfile
 
-`casc_find` needs a community listfile to resolve human-readable file names.
-Without it, files return as numeric FileDataIds (e.g., `12345` instead of `Interface/FrameXML/UIParent.lua`).
+`casc_find` auto-downloads the latest community listfile on first use — **no manual setup needed**.
 
-**Source**: [wowdev/wow-listfile](https://github.com/wowdev/wow-listfile/releases) — the canonical community listfile, also used by [wow.tools.local](https://github.com/Marlamin/wow.tools.local).
+**Source**: [wowdev/wow-listfile](https://github.com/wowdev/wow-listfile/releases) — the canonical community listfile, same source used by [wow.tools.local](https://github.com/Marlamin/wow.tools.local).
+
+**How it works**:
+- First `casc_find` without `listfilePath` → downloads `community-listfile.csv` to server directory
+- Subsequent calls → uses local cache
+- Cache older than 1 day → auto re-downloads
+- Failed download → falls back to stale cache (if exists), otherwise returns numeric FileDataIds
+
+**Manual override**: Pass `listfilePath` in `casc_find` to use a custom listfile instead.
 
 **Format**: CSV with `FileDataID;filename` lines:
 ```
 1;interface/cinematics/logo_800.avi
 53183;sound/music/citymusic/darnassus/darnassus intro.mp3
 ```
-
-**Setup**:
-1. Download `community-listfile.csv` from the [latest release](https://github.com/wowdev/wow-listfile/releases)
-2. Save to this directory
-3. Pass `listfilePath` parameter to `casc_find`
-
-**Updates**: New WoW patches add/rename files. Re-download periodically to keep lookups current.
-The listfile release is updated by the community as new files are identified.
 
 ### MCP Config
 
@@ -60,4 +59,4 @@ The listfile release is updated by the community as new files are identified.
 
 ## Version
 
-1.1.0 — Response size limits, pagination metadata, handle TTL, tool annotations.
+1.2.0 — Auto-download listfile, response limits, pagination, TTL, annotations.
