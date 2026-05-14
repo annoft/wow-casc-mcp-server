@@ -8,7 +8,7 @@ const { randomUUID } = require('crypto');
 const { join } = require('path');
 const { createWriteStream } = require('fs');
 const { pipeline } = require('stream/promises');
-const { stat } = require('fs/promises');
+const { stat, rename, unlink } = require('fs/promises');
 
 const { Storage, CascStorageInfoClass } = casclib;
 
@@ -75,38 +75,58 @@ async function _ensure_listfile() {
 
   _listfile_downloading = (async () => {
     try {
-      // Check local cache
+      // Check local cache — retain _listfile_path so fallback works on download failure
       let stale = true;
       try {
         const s = await stat(LISTFILE_CACHE);
         stale = (Date.now() - s.mtimeMs) > LISTFILE_MAX_AGE_MS;
-      } catch (_) { /* not found */ }
-
-      if (!stale) {
+        if (!stale) {
+          _listfile_path = LISTFILE_CACHE;
+          return;
+        }
+        // Cache exists but stale — set path now so error path can fall back to it
         _listfile_path = LISTFILE_CACHE;
-        return;
-      }
+      } catch (_) { /* not found, _listfile_path stays null */ }
 
-      // Download from GitHub releases
+      // Download from GitHub releases to temp file, validate size, then rename
       const res = await _with_timeout(fetch(LISTFILE_URL, {
         redirect: 'follow',
         headers: { 'User-Agent': 'wow-casc-mcp/1.2.0' }
       }), READ_TIMEOUT_MS);
 
       if (!res.ok) {
-        // If stale cache exists, keep using it
+        // Keep stale cache if we have one
         if (_listfile_path) { return; }
         throw new Error(`HTTP ${res.status} ${res.statusText}`);
       }
 
+      const expectedSize = parseInt(res.headers.get('content-length'), 10);
+      const tmpPath = LISTFILE_CACHE + '.tmp';
+
       await pipeline(
         res.body,
-        createWriteStream(LISTFILE_CACHE)
+        createWriteStream(tmpPath)
       );
 
+      // Validate downloaded size matches Content-Length
+      if (expectedSize) {
+        const actual = await stat(tmpPath);
+        if (actual.size !== expectedSize) {
+          await unlink(tmpPath).catch(() => {});
+          throw new Error(
+            `Downloaded listfile size mismatch: expected ${expectedSize} bytes, got ${actual.size}. ` +
+            `Keeping cached listfile.`
+          );
+        }
+      }
+
+      // Atomic rename to final path
+      await rename(tmpPath, LISTFILE_CACHE);
       _listfile_path = LISTFILE_CACHE;
     } catch (e) {
       _listfile_error = e.message;
+      // Clean up temp file on error
+      await unlink(LISTFILE_CACHE + '.tmp').catch(() => {});
       // If stale cache exists, keep using it
       if (_listfile_path) { return; }
       // Otherwise, listfile unavailable
