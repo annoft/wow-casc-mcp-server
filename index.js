@@ -9,12 +9,15 @@ const { join } = require('path');
 const { createWriteStream } = require('fs');
 const { pipeline } = require('stream/promises');
 const { stat, rename, unlink } = require('fs/promises');
+const { createReadStream } = require('fs');
+const { createInterface } = require('readline');
 
 const { Storage, CascStorageInfoClass } = casclib;
 
 // --- Constants ---
 const HANDLE_TTL_MS = 10 * 60 * 1000; // 10 minutes auto-cleanup
 const READ_TIMEOUT_MS = 30_000;       // 30s per file read
+const FIND_TIMEOUT_MS = 60_000;       // 60s for casc_find (JS pre-filter scans full listfile)
 const MAX_TEXT_BYTES  = 100 * 1024;   // 100KB text truncation threshold
 const MAX_BIN_BYTES   = 500 * 1024;   // 500KB binary truncation threshold
 const LISTFILE_URL    = 'https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv';
@@ -59,6 +62,12 @@ function _limit_response(buf, isText) {
   const limit = isText ? MAX_TEXT_BYTES : MAX_BIN_BYTES;
   if (buf.length <= limit) return null; // no truncation needed
   return { truncated: true, fullSize: buf.length, returned: limit };
+}
+
+// Convert wildcard mask to case-insensitive regex. Separator '/' not special.
+function _wildcard_to_regex(mask) {
+  const escaped = mask.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('^' + escaped.replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
 }
 
 // Listfile auto-download (lazy, cached). Follows wow.tools.local pattern:
@@ -186,15 +195,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'casc_find',
       description:
-        'Find files by wildcard mask. Community listfile is auto-downloaded by default ' +
-        '(from wowdev/wow-listfile) — no listfilePath needed. Override with listfilePath for custom listfile. ' +
-        'Without any listfile, files return as numeric FileDataIds. ' +
-        'Returns files array + pagination metadata (returned, has_more, total_count).',
+        'Find files by wildcard mask. Uses JS pre-filter on community listfile (no native CASC iteration — fast). ' +
+        'Community listfile auto-downloaded by default (from wowdev/wow-listfile) — no listfilePath needed. ' +
+        'Returns files array + pagination metadata (returned, has_more, total_count). ' +
+        'Note: size/available fields are null (listfile-only results). Use casc_read for exact file details.',
       inputSchema: {
         type: 'object',
         properties: {
-          handleId:     { type: 'string', description: 'Handle ID from casc_open.' },
-          mask:         { type: 'string', description: 'Wildcard mask, e.g. "*.lua" or "Interface/FrameXML/*.lua".' },
+          handleId:     { type: 'string', description: 'Handle ID from casc_open (required for listfile resolution + TTL refresh).' },
+          mask:         { type: 'string', description: 'Wildcard mask, e.g. "*.lua" or "Interface/FrameXML/*.lua". Case-insensitive.' },
           listfilePath: { type: 'string', description: 'Optional path to community-listfile.csv for human-readable names.' },
           maxResults:   { type: 'number', description: 'Max results (default 200, max 1000).' }
         },
@@ -205,7 +214,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: true,
-        title: 'Find files in CASC storage by wildcard'
+        title: 'Find files in CASC storage by wildcard (JS pre-filter)'
       }
     },
     {
@@ -285,58 +294,79 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // --- casc_find ---
+    // --- casc_find (JS pre-filter, async streaming, 60s timeout) ---
     if (name === 'casc_find') {
-      const entry = handles.get(args.handleId);
-      if (!entry) throw new Error(
-        `Unknown handleId: ${args.handleId}. The handle may have expired (TTL: 10 min). Call casc_open first to create a new handle.`
-      );
-      _register_ttl(args.handleId);
-      const storage = entry.storage;
+      return await _with_timeout((async () => {
+        const entry = handles.get(args.handleId);
+        if (!entry) throw new Error(
+          `Unknown handleId: ${args.handleId}. The handle may have expired (TTL: 10 min). Call casc_open first to create a new handle.`
+        );
+        _register_ttl(args.handleId);
 
-      // Resolve listfile: user-provided > auto-downloaded > none
-      let listfilePath = args.listfilePath || '';
-      let listfileMeta;
-      if (args.listfilePath) {
-        listfileMeta = { source: 'user-provided', path: args.listfilePath };
-      } else {
-        await _ensure_listfile();
-        listfileMeta = _listfile_status();
-        if (_listfile_path) {
-          listfilePath = _listfile_path;
+        // Resolve listfile: user-provided > auto-downloaded > none
+        let listfilePath = args.listfilePath || '';
+        let listfileMeta;
+        if (args.listfilePath) {
+          listfileMeta = { source: 'user-provided', path: args.listfilePath };
+        } else {
+          await _ensure_listfile();
+          listfileMeta = _listfile_status();
+          if (_listfile_path) {
+            listfilePath = _listfile_path;
+          }
         }
-      }
 
-      const max = Math.min(args.maxResults || 200, 1000);
-      const results = [];
-      let totalCount = 0;
-      let entry_iter = storage.findFirstFile(args.mask, listfilePath);
-      while (entry_iter) {
-        totalCount++;
-        if (results.length < max) {
-          results.push({
-            name: entry_iter.fileName,
-            fileDataId: entry_iter.fileDataId,
-            size: entry_iter.fileSize,
-            available: entry_iter.available
-          });
+        if (!listfilePath) {
+          throw new Error(
+            'No listfile available. Provide listfilePath parameter or ensure network access for auto-download. ' +
+            'Without a listfile, casc_find cannot resolve file names.'
+          );
         }
-        entry_iter = storage.findNextFile();
-      }
-      storage.findClose();
-      const hasMore = totalCount > max;
-      return {
-        content: [{ type: 'text', text: JSON.stringify({
-          returned: results.length,
-          total_count: totalCount,
-          has_more: hasMore,
-          listfile: listfileMeta,
-          ...(hasMore && {
-            hint: `${totalCount - max} more files match. Narrow your mask or increase maxResults (max 1000).`
-          }),
-          files: results
-        }) }]
-      };
+
+        const max = Math.min(args.maxResults || 200, 1000);
+        const regex = _wildcard_to_regex(args.mask);
+        const results = [];
+        let totalCount = 0;
+
+        const rl = createInterface({
+          input: createReadStream(listfilePath, 'utf8'),
+          crlfDelay: Infinity
+        });
+
+        for await (const line of rl) {
+          const semiIdx = line.indexOf(';');
+          if (semiIdx === -1) continue;
+          const fileName = line.slice(semiIdx + 1);
+          if (regex.test(fileName)) {
+            totalCount++;
+            if (results.length < max) {
+              const fileDataId = parseInt(line.slice(0, semiIdx), 10) || 0;
+              results.push({
+                name: fileName,
+                fileDataId: fileDataId,
+                size: null,
+                available: null,
+                _source: 'listfile'
+              });
+            }
+          }
+        }
+
+        const hasMore = totalCount > max;
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            returned: results.length,
+            total_count: totalCount,
+            has_more: hasMore,
+            listfile: listfileMeta,
+            method: 'js-pre-filter',
+            ...(hasMore && {
+              hint: `${totalCount - max} more files match. Narrow your mask or increase maxResults (max 1000).`
+            }),
+            files: results
+          }) }]
+        };
+      })(), FIND_TIMEOUT_MS);
     }
 
     // --- casc_read ---
