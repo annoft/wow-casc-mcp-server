@@ -100,7 +100,7 @@ async function _ensure_listfile() {
       // Download from GitHub releases to temp file, validate size, then rename
       const res = await _with_timeout(fetch(LISTFILE_URL, {
         redirect: 'follow',
-        headers: { 'User-Agent': 'wow-casc-mcp/1.2.0' }
+        headers: { 'User-Agent': 'wow-casc-mcp/1.3.0' }
       }), READ_TIMEOUT_MS);
 
       if (!res.ok) {
@@ -161,7 +161,7 @@ function _listfile_status() {
 // --- Server ---
 
 const server = new Server(
-  { name: 'wow-casc', version: '1.2.0' },
+  { name: 'wow-casc', version: '1.3.0' },
   { capabilities: { tools: {} } }
 );
 
